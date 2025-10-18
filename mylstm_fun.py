@@ -259,7 +259,6 @@ def split_data_stratified(X, y, train_size=0.7, val_size=0.15, test_size=0.15, r
 def print_label_distribution(y_train, y_val, y_test, y_full=None, print_full=False):
     """
     Print label distribution across splits to verify even distribution.
-    
     Parameters:
     -----------
     y_train, y_val, y_test : array-like
@@ -268,20 +267,24 @@ def print_label_distribution(y_train, y_val, y_test, y_full=None, print_full=Fal
         Full target labels for comparison
     print_full : bool, default=False
         Whether to print full label distribution
+    Returns:
+    --------
+    class_weights : dict
+        Class weights for training
+    class_weights_tensor : torch.Tensor
+        Class weights as tensor for PyTorch compatibility
     """
-    
     def get_label_counts(y):
         unique_labels, counts = np.unique(y, return_counts=True)
         return dict(zip(unique_labels, counts))
     
     print("Label Distribution:")
     print("-" * 30)
-    
     if print_full and y_full is not None:
         full_counts = get_label_counts(y_full)
         print("Full dataset:")
         for label, count in full_counts.items():
-            print(f"  Label {label}: {count}")
+            print(f"    Label {label}: {count}")
         print()
     
     train_counts = get_label_counts(y_train)
@@ -290,18 +293,34 @@ def print_label_distribution(y_train, y_val, y_test, y_full=None, print_full=Fal
     
     print("Train set:")
     for label, count in train_counts.items():
-        print(f"  Label {label}: {count}")
+        print(f"    Label {label}: {count}")
     print()
     
     print("Validation set:")
     for label, count in val_counts.items():
-        print(f"  Label {label}: {count}")
+        print(f"    Label {label}: {count}")
     print()
     
     print("Test set:")
     for label, count in test_counts.items():
-        print(f"  Label {label}: {count}")
+        print(f"    Label {label}: {count}")
     print()
+    
+    # Calculate class weights from training set
+    class_weights = {}
+    total_samples = len(y_train)
+    for label, count in train_counts.items():
+        # Inverse frequency weighting
+        class_weights[label] = total_samples / (len(train_counts) * count)
+    
+    # Convert to numpy array for compatibility
+    num_classes = len(train_counts)
+    weights_array = np.array([class_weights[i] for i in range(num_classes)])
+    
+    # Convert to torch tensor for PyTorch compatibility
+    weights_tensor = torch.FloatTensor(weights_array)
+    
+    return class_weights, weights_tensor
 
 # Example usage:
 # X_train, X_val, X_test, y_train, y_val, y_test = split_data_stratified(X, y, train_size=0.7, val_size=0.15, test_size=0.15)
@@ -338,17 +357,17 @@ class LSTMClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(last_dim, num_classes)
         )
-
+    
     def forward(self, x):
         # x: (B, T, F)
-        out, _ = self.lstm(x)            # (B, T, H)
-        last = out[:, -1, :]             # take last timestep
-        logits = self.head(last)         # (B, C)
+        out, _ = self.lstm(x)           # (B, T, H)
+        last = out[:, -1, :]            # take last timestep
+        logits = self.head(last)        # (B, C)
         return logits
 
 def train_lstm_classifier(
-    X_train: Union[np.ndarray, torch.Tensor],  # shape (N, T, F)
-    y_train: Union[np.ndarray, torch.Tensor],  # shape (N,) ints
+    X_train: Union[np.ndarray, torch.Tensor],   # shape (N, T, F)
+    y_train: Union[np.ndarray, torch.Tensor],   # shape (N,) ints
     X_val:   Optional[Union[np.ndarray, torch.Tensor]] = None,
     y_val:   Optional[Union[np.ndarray, torch.Tensor]] = None,
     *,
@@ -365,13 +384,12 @@ def train_lstm_classifier(
     num_workers: int = 0,
     device: Optional[str] = None,
     verbose: bool = True,
+    class_weights: Optional[Union[np.ndarray, torch.Tensor]] = None,
 ) -> Tuple[nn.Module, Dict[str, list]]:
     """
     Builds & trains an LSTM classifier with tqdm batch-by-batch bars and early stopping.
-
     Early stopping criterion: best validation loss (if val provided), else best train loss.
     Patience counts epochs without improvement.
-
     Returns:
         model: trained LSTMClassifier
         history: dict with keys: 'train_loss', 'train_acc', 'val_loss', 'val_acc'
@@ -379,19 +397,19 @@ def train_lstm_classifier(
     # ---------- device ----------
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    
     # ---------- tensors ----------
     def as_tensor(x, dtype=None):
         if isinstance(x, np.ndarray):
             return torch.from_numpy(x).to(dtype) if dtype is not None else torch.from_numpy(x)
         return x
-
+    
     X_train = as_tensor(X_train, torch.float32)
     y_train = as_tensor(y_train, torch.long)
     if X_val is not None and y_val is not None:
         X_val = as_tensor(X_val, torch.float32)
         y_val = as_tensor(y_val, torch.long)
-
+    
     # ---------- dataset & loaders ----------
     train_ds = TensorDataset(X_train, y_train)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
@@ -401,10 +419,10 @@ def train_lstm_classifier(
         val_ds = TensorDataset(X_val, y_val)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                                 num_workers=num_workers, pin_memory=(device=="cuda"))
-
+    
     # ---------- model ----------
     input_dim = X_train.shape[-1]
-    num_classes = int(torch.unique(y_train).numel())  # adapt to your labels
+    num_classes = int(torch.unique(y_train).numel())    # adapt to your labels
     model = LSTMClassifier(
         input_dim=input_dim,
         hidden_size=hidden_size,
@@ -413,50 +431,52 @@ def train_lstm_classifier(
         dropout=dropout,
         bidirectional=bidirectional,
     ).to(device)
-
+    
     # ---------- loss/opt ----------
-    criterion = nn.CrossEntropyLoss()
+    if class_weights is not None:
+        if isinstance(class_weights, np.ndarray):
+            class_weights = torch.from_numpy(class_weights).float()
+        class_weights = class_weights.to(device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+    else:
+        criterion = nn.CrossEntropyLoss()
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-
+    
     # ---------- history / early stopping ----------
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     best_metric = float("inf")
     best_state = None
     wait = 0
-
+    
     # ---------- training loop ----------
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
-
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]", leave=False)
         for xb, yb in pbar:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
-
             optimizer.zero_grad(set_to_none=True)
             logits = model(xb)
             loss = criterion(logits, yb)
             loss.backward()
-
             if clip_norm is not None:
                 nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-
             optimizer.step()
-
+            
             # batch metrics
             running_loss += loss.item() * xb.size(0)
             preds = logits.argmax(dim=1)
             correct += (preds == yb).sum().item()
             total += xb.size(0)
-
             pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{(correct/total)*100:.2f}%"})
-
+        
         train_loss = running_loss / max(1, total)
         train_acc = correct / max(1, total)
-
+        
         # ----- validation -----
         val_loss = None
         val_acc = None
@@ -477,25 +497,27 @@ def train_lstm_classifier(
                     v_correct += (preds == yb).sum().item()
                     v_total += xb.size(0)
                     pbar_val.set_postfix({"loss": f"{loss.item():.4f}"})
-            val_loss = v_loss / max(1, v_total)
-            val_acc = v_correct / max(1, v_total)
-
+                
+                val_loss = v_loss / max(1, v_total)
+                val_acc = v_correct / max(1, v_total)
+        
         # ----- logging (TensorFlow-ish one-liner) -----
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
         if val_loader is not None:
             history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
-            if verbose:
+        
+        if verbose:
+            if val_loader is not None:
                 print(f"Epoch {epoch:03d}/{epochs} - "
                       f"loss: {train_loss:.4f} - acc: {train_acc:.4f} - "
                       f"val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f}")
-            metric_now = val_loss
-        else:
-            if verbose:
+            else:
                 print(f"Epoch {epoch:03d}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f}")
-            metric_now = train_loss
-
+        
+        metric_now = val_loss if val_loader is not None else train_loss
+        
         # ----- early stopping on (val_)loss -----
         if metric_now < best_metric - 1e-6:
             best_metric = metric_now
@@ -507,11 +529,11 @@ def train_lstm_classifier(
                 if verbose:
                     print(f"Early stopping at epoch {epoch} (best {( 'val_' if val_loader else '' )}loss={best_metric:.4f}).")
                 break
-
+    
     # load best weights if we have them
     if best_state is not None:
         model.load_state_dict(best_state)
-
+    
     return model, history
 
 import numpy as np
@@ -580,3 +602,309 @@ def evaluate_model(model, X_test, y_test, batch_size=256, device=None, verbose=T
         "balanced_accuracy": bal_acc,
         "classification_report": report
     }
+
+
+from typing import Dict, Optional, Tuple, Union, Sequence
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from tqdm.auto import tqdm
+
+# ---------------------------
+# Model
+# ---------------------------
+class CNNLSTMClassifier(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,                 # F features per timestep
+        num_classes: int,
+        cnn_channels: Sequence[int] = (32, 64),
+        kernel_size: int = 5,
+        pool_size: int = 2,
+        lstm_hidden: int = 128,
+        lstm_layers: int = 1,
+        dropout: float = 0.0,
+        bidirectional: bool = False,
+        use_batchnorm: bool = True,
+    ):
+        super().__init__()
+        # Conv1d over time: (B, F, T) -> (B, C, T')
+        convs = []
+        in_ch = input_dim
+        for out_ch in cnn_channels:
+            block = []
+            block += [nn.Conv1d(in_ch, out_ch, kernel_size, padding=kernel_size//2)]
+            if use_batchnorm:
+                block += [nn.BatchNorm1d(out_ch)]
+            block += [nn.ReLU(inplace=True)]
+            if pool_size and pool_size > 1:
+                block += [nn.MaxPool1d(pool_size)]
+            block += [nn.Dropout(dropout)]
+            convs += block
+            in_ch = out_ch
+        self.conv = nn.Sequential(*convs)
+
+        lstm_input_dim = in_ch
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_dim,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+            batch_first=True,
+            bidirectional=bidirectional,
+        )
+        last_dim = lstm_hidden * (2 if bidirectional else 1)
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(last_dim, num_classes)
+        )
+
+    def forward(self, x):
+        # x: (B, T, F)
+        x = x.transpose(1, 2)              # -> (B, F, T)
+        x = self.conv(x)                   # -> (B, C, T')
+        x = x.transpose(1, 2)              # -> (B, T', C)
+        out, _ = self.lstm(x)              # -> (B, T', H)
+        last = out[:, -1, :]               # take last timestep
+        logits = self.head(last)           # -> (B, C)
+        return logits
+    
+
+# ----- imports (put at top of your module) -----
+from typing import Sequence, Tuple, Optional, Union
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+
+# ----- model -----
+class CNNLSTMClassifier(nn.Module):
+    """
+    Expects input shaped (B, T, F): T=time steps, F=features/channels.
+    Applies Conv1d over time (treating F as channels), then LSTM over time.
+    """
+    def __init__(
+        self,
+        *,
+        input_dim: int,            # F
+        num_classes: int,
+        cnn_channels: Sequence[int] = (32, 64),
+        kernel_size: int = 5,
+        pool_size: int = 2,
+        lstm_hidden: int = 128,
+        lstm_layers: int = 1,
+        dropout: float = 0.0,
+        bidirectional: bool = False,
+    ):
+        super().__init__()
+        assert input_dim > 0, "input_dim must be > 0"
+        assert kernel_size >= 1 and pool_size >= 1
+
+        # Conv stack over time: input (B, F, T) -> Conv1d expects (B, C_in, L=T)
+        convs = []
+        in_ch = input_dim
+        for out_ch in cnn_channels:
+            convs.append(nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=kernel_size // 2))
+            convs.append(nn.ReLU(inplace=True))
+            convs.append(nn.MaxPool1d(kernel_size=pool_size, stride=pool_size))
+            in_ch = out_ch
+        self.conv = nn.Sequential(*convs) if convs else nn.Identity()
+
+        # LSTM over time: we’ll transpose back to (B, T', C') for LSTM
+        self.lstm = nn.LSTM(
+            input_size=in_ch,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            dropout=(dropout if lstm_layers > 1 else 0.0),
+            bidirectional=bidirectional,
+            batch_first=True,
+        )
+
+        lstm_out_dim = lstm_hidden * (2 if bidirectional else 1)
+        self.head = nn.Sequential(
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(lstm_out_dim, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, F) -> (B, F, T) for Conv1d
+        x = x.transpose(1, 2)                       # (B, F, T)
+        x = self.conv(x)                            # (B, C', T')
+        x = x.transpose(1, 2).contiguous()          # (B, T', C')
+
+        # LSTM over time dimension
+        out, (h_n, c_n) = self.lstm(x)              # out: (B, T', H)
+        # Use the last time step (could also use mean-pool)
+        last = out[:, -1, :]                        # (B, H)
+        logits = self.head(last)                    # (B, num_classes)
+        return logits
+
+# ---------------------------
+# Trainer (CNN-LSTM)
+# ---------------------------
+def train_cnnlstm_classifier(
+    
+    X_train: Union[np.ndarray, torch.Tensor],  # (N, T, F)
+    y_train: Union[np.ndarray, torch.Tensor],  # (N,)
+    X_val:   Optional[Union[np.ndarray, torch.Tensor]] = None,
+    y_val:   Optional[Union[np.ndarray, torch.Tensor]] = None,
+    *,
+    # CNN specifics
+    cnn_channels: Sequence[int] = (32, 64),
+    kernel_size: int = 5,
+    pool_size: int = 2,
+    # LSTM specifics
+    lstm_hidden: int = 128,
+    lstm_layers: int = 1,
+    dropout: float = 0.0,
+    bidirectional: bool = False,
+    # Training
+    batch_size: int = 256,
+    epochs: int = 20,
+    lr: float = 1e-3,
+    weight_decay: float = 0.0,
+    patience: int = 5,
+    clip_norm: Optional[float] = None,
+    num_workers: int = 0,
+    device: Optional[str] = None,
+    verbose: bool = True,
+) -> Tuple[nn.Module, Dict[str, list]]:
+    """
+    Train a CNN+LSTM classifier with tqdm bars and early stopping on (val_)loss.
+    Returns: (model, history) with keys: train_loss, train_acc, val_loss, val_acc
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # --- to tensors ---
+    def as_tensor(x, dtype=None):
+        if isinstance(x, np.ndarray):
+            return torch.from_numpy(x).to(dtype) if dtype is not None else torch.from_numpy(x)
+        return x
+
+    X_train = as_tensor(X_train, torch.float32)
+    y_train = as_tensor(y_train, torch.long)
+    if X_val is not None and y_val is not None:
+        X_val = as_tensor(X_val, torch.float32)
+        y_val = as_tensor(y_val, torch.long)
+
+    # --- loaders ---
+    train_loader = DataLoader(
+        TensorDataset(X_train, y_train),
+        batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=(device == "cuda")
+    )
+    val_loader = None
+    if X_val is not None and y_val is not None:
+        val_loader = DataLoader(
+            TensorDataset(X_val, y_val),
+            batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=(device == "cuda")
+        )
+
+    # --- model ---
+    input_dim = X_train.shape[-1]
+    num_classes = int(torch.unique(y_train).numel())
+    model = CNNLSTMClassifier(
+        input_dim=input_dim,
+        num_classes=num_classes,
+        cnn_channels=cnn_channels,
+        kernel_size=kernel_size,
+        pool_size=pool_size,
+        lstm_hidden=lstm_hidden,
+        lstm_layers=lstm_layers,
+        dropout=dropout,
+        bidirectional=bidirectional,
+    ).to(device)
+
+    # --- loss/opt ---
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # --- history / early stopping ---
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    best_metric = float("inf")
+    best_state = None
+    wait = 0
+
+    # --- loop ---
+    for epoch in range(1, epochs + 1):
+        model.train()
+        run_loss, correct, total = 0.0, 0, 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]", leave=False)
+        for xb, yb in pbar:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            if clip_norm is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+            optimizer.step()
+
+            run_loss += loss.item() * xb.size(0)
+            preds = logits.argmax(1)
+            correct += (preds == yb).sum().item()
+            total += xb.size(0)
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{(correct/total)*100:.2f}%"})
+
+        train_loss = run_loss / max(1, total)
+        train_acc = correct / max(1, total)
+
+        val_loss = None
+        val_acc = None
+        if val_loader is not None:
+            model.eval()
+            v_loss, v_correct, v_total = 0.0, 0, 0
+            with torch.no_grad():
+                pbar_val = tqdm(val_loader, desc=f"Epoch {epoch}/{epochs} [Val]", leave=False)
+                for xb, yb in pbar_val:
+                    xb = xb.to(device, non_blocking=True)
+                    yb = yb.to(device, non_blocking=True)
+                    logits = model(xb)
+                    loss = criterion(logits, yb)
+                    v_loss += loss.item() * xb.size(0)
+                    v_correct += (logits.argmax(1) == yb).sum().item()
+                    v_total += xb.size(0)
+                    pbar_val.set_postfix({"loss": f"{loss.item():.4f}"})
+            val_loss = v_loss / max(1, v_total)
+            val_acc = v_correct / max(1, v_total)
+
+        # log TF-ish line
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        if val_loader is not None:
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+            if verbose:
+                print(f"Epoch {epoch:03d}/{epochs} - "
+                      f"loss: {train_loss:.4f} - acc: {train_acc:.4f} - "
+                      f"val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f}")
+            metric_now = val_loss
+        else:
+            if verbose:
+                print(f"Epoch {epoch:03d}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f}")
+            metric_now = train_loss
+
+        # early stop on best (val_)loss
+        if metric_now < best_metric - 1e-6:
+            best_metric = metric_now
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                if verbose:
+                    best_name = "val_loss" if val_loader is not None else "loss"
+                    print(f"Early stopping at epoch {epoch} (best {best_name}={best_metric:.4f}).")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model, history
