@@ -513,3 +513,70 @@ def train_lstm_classifier(
         model.load_state_dict(best_state)
 
     return model, history
+
+import numpy as np
+import torch
+from sklearn.metrics import balanced_accuracy_score, classification_report
+
+def evaluate_model(model, X_test, y_test, batch_size=256, device=None, verbose=True, label_names=None):
+    """
+    Evaluate a trained LSTM model and report balanced accuracy + classification report.
+
+    Args:
+        model: trained PyTorch model.
+        X_test, y_test: arrays or tensors of shape (N, T, F) and (N,)
+        batch_size: evaluation batch size.
+        device: "cuda" or "cpu" (auto-detect if None)
+        verbose: whether to print metrics.
+        label_names: optional list of class label names for the report.
+
+    Returns:
+        dict with:
+            - balanced_accuracy
+            - classification_report (as dict)
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Convert numpy to tensors if needed
+    if isinstance(X_test, np.ndarray):
+        X_test = torch.from_numpy(X_test).float()
+    if isinstance(y_test, np.ndarray):
+        y_test = torch.from_numpy(y_test).long()
+
+    # Move model to device and eval mode
+    model.to(device)
+    model.eval()
+
+    preds, trues = [], []
+    with torch.no_grad():
+        for i in range(0, len(X_test), batch_size):
+            xb = X_test[i:i + batch_size].to(device)
+            yb = y_test[i:i + batch_size].to(device)
+            logits = model(xb)
+            pred = torch.argmax(logits, dim=1)
+            preds.append(pred.cpu())
+            trues.append(yb.cpu())
+
+    y_pred = torch.cat(preds).numpy()
+    y_true = torch.cat(trues).numpy()
+
+    # Compute metrics
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
+    report = classification_report(
+        y_true, y_pred,
+        target_names=label_names,
+        digits=4,
+        output_dict=True
+    )
+
+    if verbose:
+        print("\n=== Test Results ===")
+        print(f"Balanced Accuracy: {bal_acc:.4f}")
+        print("\nClassification Report:")
+        print(classification_report(y_true, y_pred, target_names=label_names, digits=4))
+
+    return {
+        "balanced_accuracy": bal_acc,
+        "classification_report": report
+    }
