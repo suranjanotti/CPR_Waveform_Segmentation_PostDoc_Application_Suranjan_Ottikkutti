@@ -774,6 +774,17 @@ class CNNLSTMClassifier(nn.Module):
         logits = self.head(last)                    # (B, num_classes)
         return logits
 
+# mylstm_fun.py
+
+# Add these imports at the top of the file
+import torch
+import numpy as np
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+from typing import Optional, Sequence, Tuple, Union
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter  # Add this import
+
 # ---------------------------
 # Trainer (CNN-LSTM)
 # ---------------------------
@@ -804,6 +815,8 @@ def train_cnnlstm_classifier(
     device: Optional[str] = None,
     verbose: bool = True,
     class_weights: Optional[torch.Tensor] = None,
+    # TensorBoard logging
+    log_dir: Optional[str] = None,
 ) -> Tuple[nn.Module, Dict[str, list]]:
     """
     Train a CNN+LSTM classifier with tqdm bars and early stopping on (val_)loss.
@@ -811,6 +824,8 @@ def train_cnnlstm_classifier(
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    
 
     # --- to tensors ---
     def as_tensor(x, dtype=None):
@@ -854,8 +869,16 @@ def train_cnnlstm_classifier(
     ).to(device)
 
     # --- loss/opt ---
+    # Move class_weights to device if provided
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # --- TensorBoard writer ---
+    writer = None
+    if log_dir is not None:
+        writer = SummaryWriter(log_dir=log_dir)
 
     # --- history / early stopping ---
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
@@ -925,6 +948,14 @@ def train_cnnlstm_classifier(
                 print(f"Epoch {epoch:03d}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f}")
             metric_now = train_loss
 
+        # TensorBoard logging
+        if writer is not None:
+            writer.add_scalar('Loss/Train', train_loss, epoch)
+            writer.add_scalar('Accuracy/Train', train_acc, epoch)
+            if val_loader is not None:
+                writer.add_scalar('Loss/Validation', val_loss, epoch)
+                writer.add_scalar('Accuracy/Validation', val_acc, epoch)
+
         # early stop on best (val_)loss
         if metric_now < best_metric - 1e-6:
             best_metric = metric_now
@@ -940,5 +971,9 @@ def train_cnnlstm_classifier(
 
     if best_state is not None:
         model.load_state_dict(best_state)
+
+    # Close TensorBoard writer
+    if writer is not None:
+        writer.close()
 
     return model, history
