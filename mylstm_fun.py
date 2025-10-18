@@ -365,6 +365,18 @@ class LSTMClassifier(nn.Module):
         logits = self.head(last)        # (B, C)
         return logits
 
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from typing import Union, Optional, Tuple
+from tqdm import tqdm
+import numpy as np
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
+
 def train_lstm_classifier(
     X_train: Union[np.ndarray, torch.Tensor],   # shape (N, T, F)
     y_train: Union[np.ndarray, torch.Tensor],   # shape (N,) ints
@@ -385,6 +397,7 @@ def train_lstm_classifier(
     device: Optional[str] = None,
     verbose: bool = True,
     class_weights: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    tb_log_dir: Optional[str] = None,  # New parameter for TensorBoard logging
 ) -> Tuple[nn.Module, Dict[str, list]]:
     """
     Builds & trains an LSTM classifier with tqdm batch-by-batch bars and early stopping.
@@ -394,11 +407,11 @@ def train_lstm_classifier(
         model: trained LSTMClassifier
         history: dict with keys: 'train_loss', 'train_acc', 'val_loss', 'val_acc'
     """
-    # ---------- device ----------
+    # ---------- device --------
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # ---------- tensors ----------
+    # ---------- tensors --------
     def as_tensor(x, dtype=None):
         if isinstance(x, np.ndarray):
             return torch.from_numpy(x).to(dtype) if dtype is not None else torch.from_numpy(x)
@@ -410,7 +423,7 @@ def train_lstm_classifier(
         X_val = as_tensor(X_val, torch.float32)
         y_val = as_tensor(y_val, torch.long)
     
-    # ---------- dataset & loaders ----------
+    # ---------- dataset & loaders --------
     train_ds = TensorDataset(X_train, y_train)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=(device=="cuda"))
@@ -420,7 +433,7 @@ def train_lstm_classifier(
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                                 num_workers=num_workers, pin_memory=(device=="cuda"))
     
-    # ---------- model ----------
+    # ---------- model --------
     input_dim = X_train.shape[-1]
     num_classes = int(torch.unique(y_train).numel())    # adapt to your labels
     model = LSTMClassifier(
@@ -432,7 +445,7 @@ def train_lstm_classifier(
         bidirectional=bidirectional,
     ).to(device)
     
-    # ---------- loss/opt ----------
+    # ---------- loss/opt --------
     if class_weights is not None:
         if isinstance(class_weights, np.ndarray):
             class_weights = torch.from_numpy(class_weights).float()
@@ -443,13 +456,20 @@ def train_lstm_classifier(
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     
-    # ---------- history / early stopping ----------
+    # ---------- TensorBoard setup --------
+    writer = None
+    if tb_log_dir is not None and TENSORBOARD_AVAILABLE:
+        writer = SummaryWriter(tb_log_dir)
+        if verbose:
+            print(f"TensorBoard logging to {tb_log_dir}")
+    
+    # ---------- history / early stopping --------
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     best_metric = float("inf")
     best_state = None
     wait = 0
     
-    # ---------- training loop ----------
+    # ---------- training loop --------
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
@@ -516,6 +536,14 @@ def train_lstm_classifier(
             else:
                 print(f"Epoch {epoch:03d}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f}")
         
+        # ----- TensorBoard logging -----
+        if writer is not None:
+            writer.add_scalar('Loss/Train', train_loss, epoch)
+            writer.add_scalar('Accuracy/Train', train_acc, epoch)
+            if val_loader is not None:
+                writer.add_scalar('Loss/Validation', val_loss, epoch)
+                writer.add_scalar('Accuracy/Validation', val_acc, epoch)
+        
         metric_now = val_loss if val_loader is not None else train_loss
         
         # ----- early stopping on (val_)loss -----
@@ -534,7 +562,12 @@ def train_lstm_classifier(
     if best_state is not None:
         model.load_state_dict(best_state)
     
+    # Close TensorBoard writer
+    if writer is not None:
+        writer.close()
+    
     return model, history
+
 
 import numpy as np
 import torch
@@ -770,6 +803,7 @@ def train_cnnlstm_classifier(
     num_workers: int = 0,
     device: Optional[str] = None,
     verbose: bool = True,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[nn.Module, Dict[str, list]]:
     """
     Train a CNN+LSTM classifier with tqdm bars and early stopping on (val_)loss.
@@ -820,7 +854,7 @@ def train_cnnlstm_classifier(
     ).to(device)
 
     # --- loss/opt ---
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # --- history / early stopping ---
